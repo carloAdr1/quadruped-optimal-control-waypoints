@@ -15,3 +15,7 @@ venv/
 
 .DS_Store
 *.bak
+
+!docs/
+!docs/results/
+!docs/results/**
