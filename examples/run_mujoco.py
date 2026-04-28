@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""Run PMP / LQG / MPC controllers on a quadruped robot in MuJoCo with rendering.
-
-Examples:
-    python examples/run_mujoco.py
-    python examples/run_mujoco.py --controller pmp
-    python examples/run_mujoco.py --controller mpc --robot-name mini_cheetah
-    python examples/run_mujoco.py --controller lqg --robot-name go2 --teleop
-    python examples/run_mujoco.py --controller all --robot-name mini_cheetah --no-render
-    python examples/run_mujoco.py --controller lqg --disturbance persistent --teleop
-
-Teleop keys:
-    Arrow Up / Arrow Down    -> forward / backward
-    Arrow Left / Arrow Right -> yaw left / right
-    z / c                    -> lateral left / right
-    Space                    -> zero commands
-"""
-
 import sys
 import os
 import argparse
@@ -27,42 +10,37 @@ from dataclasses import dataclass
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from gym_quadruped.quadruped_env import QuadrupedEnv
-
+from src.trajectory_generator import WaypointTrajectory, build_named_trajectory
 from src.dynamics import QuadrupedDynamics
 from src.estimator_ekf import OrientationEKF
 from src.controller_pmp import PontryaginController
 from src.controller_lqg import LQGController
 from src.controller_mpc import MPCController
+from src.gait_scheduler import TrotGaitScheduler, LEG_ORDER
+from src.foot_trajectory import JointSpaceTrotPlanner
 
 
-# =====================================================================
-# Nominal physical parameters
-# =====================================================================
 ROBOT_MASS = 9.0
-ROBOT_BODY_MASS = 6.921
 ROBOT_INERTIA = np.diag([0.107, 0.098, 0.024])
 ROBOT_HIP_HEIGHT = 0.225
 ROBOT_FOOT_OFFSET = np.array([
-    [0.19,  0.111, -0.225],   # FL
-    [0.19, -0.111, -0.225],   # FR
-    [-0.19,  0.111, -0.225],  # RL
-    [-0.19, -0.111, -0.225],  # RR
+    [0.19,  0.111, -0.225],
+    [0.19, -0.111, -0.225],
+    [-0.19,  0.111, -0.225],
+    [-0.19, -0.111, -0.225],
 ])
 
 
-# =====================================================================
-# Teleop
-# =====================================================================
 @dataclass
 class TeleopState:
     vx: float = 0.0
     vy: float = 0.0
     wz: float = 0.0
-    step_lin: float = 0.05
-    step_ang: float = 0.15
-    max_vx: float = 0.8
-    max_vy: float = 0.5
-    max_wz: float = 1.5
+    step_lin: float = 0.03
+    step_ang: float = 0.08
+    max_vx: float = 0.20
+    max_vy: float = 0.10
+    max_wz: float = 0.40
     quit_requested: bool = False
 
     def clamp(self):
@@ -77,14 +55,6 @@ class TeleopState:
 
 
 def teleop_keyboard_loop(teleop: TeleopState):
-    """
-    Terminal teleop with arrow keys:
-      ↑ / ↓   -> vx +/-
-      ← / →   -> wz +/-
-      z / c   -> vy +/-
-      space   -> zero commands
-      Ctrl+C  -> quit
-    """
     import termios
     import tty
 
@@ -107,17 +77,15 @@ def teleop_keyboard_loop(teleop: TeleopState):
                 if ch == "\x1b":
                     seq1 = sys.stdin.read(1)
                     seq2 = sys.stdin.read(1)
-
                     if seq1 == "[":
-                        if seq2 == "A":       # Up
+                        if seq2 == "A":
                             teleop.vx += teleop.step_lin
-                        elif seq2 == "B":     # Down
+                        elif seq2 == "B":
                             teleop.vx -= teleop.step_lin
-                        elif seq2 == "C":     # Right
+                        elif seq2 == "C":
                             teleop.wz -= teleop.step_ang
-                        elif seq2 == "D":     # Left
+                        elif seq2 == "D":
                             teleop.wz += teleop.step_ang
-
                 elif ch == "z":
                     teleop.vy += teleop.step_lin
                 elif ch == "c":
@@ -131,7 +99,6 @@ def teleop_keyboard_loop(teleop: TeleopState):
                     end="",
                     flush=True,
                 )
-
     except KeyboardInterrupt:
         teleop.quit_requested = True
     finally:
@@ -139,11 +106,11 @@ def teleop_keyboard_loop(teleop: TeleopState):
         print()
 
 
-# =====================================================================
-# Helpers
-# =====================================================================
+def wrap_to_pi(angle):
+    return np.arctan2(np.sin(angle), np.cos(angle))
+
+
 def get_state(env) -> np.ndarray:
-    """Extract x = [p(3), v(3), rpy(3), ω_body(3)] from the MuJoCo env."""
     p = env.base_pos.copy()
     v = env.base_lin_vel(frame="world")
     rpy = env.base_ori_euler_xyz.copy()
@@ -152,9 +119,7 @@ def get_state(env) -> np.ndarray:
 
 
 def grf_to_torques(env, grfs: np.ndarray, contact: np.ndarray) -> np.ndarray:
-    """Convert ground reaction forces to joint torques via Jacobian transpose."""
     tau = np.zeros(env.mjModel.nu)
-
     try:
         jacobians = env.feet_jacobians(frame="world")
     except Exception:
@@ -163,21 +128,17 @@ def grf_to_torques(env, grfs: np.ndarray, contact: np.ndarray) -> np.ndarray:
     for i, leg in enumerate(["FL", "FR", "RL", "RR"]):
         if not contact[i]:
             continue
-
         f_leg = grfs[3 * i: 3 * i + 3]
         J_full = jacobians[leg]
         leg_idx = env.legs_qvel_idx[leg]
         J_leg = J_full[:, leg_idx]
         tau_leg = -J_leg.T @ f_leg
-
         tau_idx = env.legs_tau_idx[leg]
         tau[tau_idx] = tau_leg
-
     return tau
 
 
 def get_contacts(env) -> np.ndarray:
-    """Return (4,) boolean contact mask [FL, FR, RL, RR]."""
     try:
         cs, _ = env.feet_contact_state()
         return np.array([cs.FL, cs.FR, cs.RL, cs.RR], dtype=bool)
@@ -186,7 +147,6 @@ def get_contacts(env) -> np.ndarray:
 
 
 def get_feet_world(env) -> np.ndarray:
-    """Return (4, 3) foot positions in world frame."""
     try:
         fp = env.feet_pos(frame="world")
         return np.array([fp.FL, fp.FR, fp.RL, fp.RR])
@@ -194,9 +154,40 @@ def get_feet_world(env) -> np.ndarray:
         return None
 
 
-# =====================================================================
-# Dynamics and references
-# =====================================================================
+def get_joint_state_dict(env):
+    """
+    Asume 12 joints al final de qpos y qvel.
+    Orden esperado: FL, FR, RL, RR (3 por pata).
+    """
+    qj = env.mjData.qpos[-12:].copy().reshape(4, 3)
+    dqj = env.mjData.qvel[-12:].copy().reshape(4, 3)
+
+    q_dict = {leg: qj[i].copy() for i, leg in enumerate(LEG_ORDER)}
+    dq_dict = {leg: dqj[i].copy() for i, leg in enumerate(LEG_ORDER)}
+    return q_dict, dq_dict
+
+
+def compute_gait_pd_torque(env, q_des_dict, q_dict, dq_dict, kp=None, kd=None):
+    if kp is None:
+        kp = np.array([18.0, 22.0, 16.0])
+    if kd is None:
+        kd = np.array([0.8, 1.0, 0.7])
+
+    tau = np.zeros(env.mjModel.nu)
+
+    for leg in LEG_ORDER:
+        q = q_dict[leg]
+        dq = dq_dict[leg]
+        q_des = q_des_dict[leg]
+
+        tau_leg = kp * (q_des - q) - kd * dq
+
+        tau_idx = env.legs_tau_idx[leg]
+        tau[tau_idx] = tau_leg
+
+    return tau
+
+
 def build_dynamics():
     dyn = QuadrupedDynamics(
         mass=ROBOT_MASS,
@@ -209,37 +200,30 @@ def build_dynamics():
 
 def build_cost_matrices():
     Q = np.diag([
-        80, 80, 400,    # position
-        8, 8, 40,       # velocity
-        150, 150, 30,   # orientation
-        1, 1, 4,        # angular velocity
+        20, 20, 300,
+        12, 12, 50,
+        120, 120, 20,
+        2, 2, 6,
     ])
-    R = np.eye(12) * 1e-4
-    Q_f = Q * 5
+    R = np.eye(12) * 5e-4
+    Q_f = Q * 3
     return Q, R, Q_f
 
 
-def build_reference_state(
-    dyn: QuadrupedDynamics,
-    height: float,
-    vx: float = 0.0,
-    vy: float = 0.0,
-    wz: float = 0.0,
-) -> np.ndarray:
+def build_reference_state_from_velocity_guidance(x, height, vx_cmd, vy_cmd, yaw_cmd, wz_cmd):
     """
-    x = [p(3), v(3), rpy(3), omega(3)]
-    Track commanded planar velocity and yaw rate while keeping upright.
+    Referencia suave:
+    - mantiene posición actual en x,y para no pelear contra locomoción inexistente
+    - sí sigue velocidades y yaw
     """
-    x_ref = dyn.standing_state(height=height)
-    x_ref[3:6] = np.array([vx, vy, 0.0])
-    x_ref[6:9] = np.array([0.0, 0.0, 0.0])
-    x_ref[9:12] = np.array([0.0, 0.0, wz])
+    x_ref = x.copy()
+    x_ref[2] = height
+    x_ref[3:6] = np.array([vx_cmd, vy_cmd, 0.0])
+    x_ref[6:9] = np.array([0.0, 0.0, yaw_cmd])
+    x_ref[9:12] = np.array([0.0, 0.0, wz_cmd])
     return x_ref
 
 
-# =====================================================================
-# Controllers
-# =====================================================================
 def build_controller(name: str, dyn: QuadrupedDynamics, Q, R, Q_f, x_ref):
     A_d, B_d, g_d = dyn.get_linear_system(x_ref)
     A_c, B_c = dyn.continuous_AB(x_ref)
@@ -253,7 +237,7 @@ def build_controller(name: str, dyn: QuadrupedDynamics, Q, R, Q_f, x_ref):
             Q_f=Q_f,
             g_aff=dyn.gravity_vector() / dyn.dt,
             dt=dyn.dt,
-            horizon=500,
+            horizon=300,
         )
         ctrl.solve_discrete_sweep(x_ref.copy(), x_ref)
         print("  [PMP] Hamiltonian-based controller initialized")
@@ -266,7 +250,7 @@ def build_controller(name: str, dyn: QuadrupedDynamics, Q, R, Q_f, x_ref):
             g_d=g_d,
             Q=Q * dyn.dt,
             R=R * dyn.dt,
-            Q_proc=np.diag([1e-3] * 3 + [1e-2] * 3 + [5e-3] * 3 + [1e-2] * 3),
+            Q_proc=np.diag([1e-3] * 3 + [5e-3] * 3 + [5e-3] * 3 + [1e-2] * 3),
             R_meas=np.diag([5e-3] * 3 + [2e-2] * 3 + [1e-2] * 3 + [5e-2] * 3),
         )
         ctrl.set_initial_estimate(x_ref)
@@ -281,20 +265,32 @@ def build_controller(name: str, dyn: QuadrupedDynamics, Q, R, Q_f, x_ref):
             Q=Q * dyn.dt,
             R=R * dyn.dt,
             Q_f=Q_f * dyn.dt,
-            N=10,
+            N=8,
             mu=0.6,
-            fz_max=150.0,
+            fz_max=120.0,
         )
-        print("  [MPC] Horizon=10, OSQP-based controller initialized")
+        print("  [MPC] Horizon=8, OSQP-based controller initialized")
         return ctrl
 
     raise ValueError(f"Unknown controller: {name}")
 
 
-# =====================================================================
-# Plotting
-# =====================================================================
-def save_single_run_plot(result, controller_name, robot_name, disturbance_type, x_ref_nominal):
+def make_velocity_command_from_waypoints(x, trajectory, t, speed_cap=0.02, yaw_k=0.4):
+    pos_ref, vel_ref, euler_ref, omega_ref, _ = trajectory.sample(t, nominal_height=ROBOT_HIP_HEIGHT)
+
+    dx = pos_ref[0] - x[0]
+    dy = pos_ref[1] - x[1]
+    desired_yaw = np.arctan2(dy, dx) if (dx * dx + dy * dy) > 1e-8 else euler_ref[2]
+    yaw_err = wrap_to_pi(desired_yaw - x[8])
+
+    vx_cmd = float(np.clip(vel_ref[0], -speed_cap, speed_cap))
+    vy_cmd = float(np.clip(vel_ref[1], -0.5 * speed_cap, 0.5 * speed_cap))
+    wz_cmd = float(np.clip(yaw_k * yaw_err, -0.05, 0.05))
+
+    return vx_cmd, vy_cmd, desired_yaw, wz_cmd, pos_ref
+
+
+def save_single_run_plot(result, controller_name, robot_name, disturbance_type):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -303,118 +299,55 @@ def save_single_run_plot(result, controller_name, robot_name, disturbance_type, 
 
     log_t = result["time"]
     log_x = result["state"]
+    log_pos_ref = result["pos_ref"]
     log_u = result["control"]
     log_dist = result["disturbance"]
 
     fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
-    fig.suptitle(
-        f"{controller_name.upper()} — {robot_name} — {disturbance_type}",
-        fontsize=14,
-        fontweight="bold",
-    )
 
-    labels_p = [r"$p_x$", r"$p_y$", r"$p_z$"]
-    for i in range(3):
-        axes[0].plot(log_t, log_x[:, i], label=labels_p[i])
-        axes[0].axhline(x_ref_nominal[i], ls="--", color="gray", lw=0.6)
-    axes[0].set_ylabel("Position [m]")
-    axes[0].legend(ncol=3, fontsize=8)
+    axes[0].plot(log_t, log_x[:, 0], label="x")
+    axes[0].plot(log_t, log_pos_ref[:, 0], "--", label="x_ref")
+    axes[0].plot(log_t, log_x[:, 1], label="y")
+    axes[0].plot(log_t, log_pos_ref[:, 1], "--", label="y_ref")
+    axes[0].set_ylabel("XY [m]")
+    axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    labels_v = [r"$v_x$", r"$v_y$", r"$v_z$"]
-    for i in range(3):
-        axes[1].plot(log_t, log_x[:, 3 + i], label=labels_v[i])
+    axes[1].plot(log_t, log_x[:, 3], label="vx")
+    axes[1].plot(log_t, log_x[:, 4], label="vy")
     axes[1].set_ylabel("Velocity [m/s]")
-    axes[1].legend(ncol=3, fontsize=8)
+    axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
-    labels_o = ["roll", "pitch", "yaw"]
-    for i in range(3):
-        axes[2].plot(log_t, np.degrees(log_x[:, 6 + i]), label=labels_o[i])
-    axes[2].set_ylabel("Orientation [deg]")
-    axes[2].legend(ncol=3, fontsize=8)
+    axes[2].plot(log_t, np.linalg.norm(log_x[:, :2] - log_pos_ref[:, :2], axis=1), label="XY error")
+    axes[2].set_ylabel("XY err [m]")
+    axes[2].legend()
     axes[2].grid(True, alpha=0.3)
 
     axes[3].plot(log_t, np.linalg.norm(log_u, axis=1), label="||GRFs||")
     axes[3].fill_between(log_t, 0, log_dist * 2, alpha=0.25, label="disturbance")
     axes[3].set_ylabel("Force [N]")
     axes[3].set_xlabel("Time [s]")
-    axes[3].legend(fontsize=8)
+    axes[3].legend()
     axes[3].grid(True, alpha=0.3)
 
-    for ax in axes:
-        if disturbance_type == "impulse":
-            ax.axvspan(2.0, 2.15, alpha=0.1)
-        elif disturbance_type == "persistent":
-            ax.axvspan(2.0, log_t[-1], alpha=0.05)
-
-    plt.tight_layout()
     path = f"results/mujoco_{controller_name}_{robot_name}_{disturbance_type}.png"
+    plt.tight_layout()
     plt.savefig(path, dpi=150)
     plt.close()
     print(f"\n  Plot saved: {path}")
 
 
-def save_comparison_plot(results, robot_name, disturbance_type):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    os.makedirs("results", exist_ok=True)
-
-    colors = {"pmp": "#e74c3c", "lqg": "#2ecc71", "mpc": "#3498db"}
-
-    fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
-    fig.suptitle(
-        f"Controller Comparison — {robot_name} — {disturbance_type}",
-        fontsize=14,
-        fontweight="bold",
-    )
-
-    for name, data in results.items():
-        t = data["time"]
-        x = data["state"]
-        u = data["control"]
-
-        pos_err = np.linalg.norm(x[:, :3] - np.array([0.0, 0.0, ROBOT_HIP_HEIGHT]), axis=1)
-        vel_err = np.linalg.norm(x[:, 3:6], axis=1)
-        u_norm = np.linalg.norm(u, axis=1)
-
-        axes[0].plot(t, pos_err, color=colors[name], label=name.upper(), lw=1.5)
-        axes[1].plot(t, vel_err, color=colors[name], lw=1.5)
-        axes[2].plot(t, u_norm, color=colors[name], lw=1.2)
-
-    axes[0].set_ylabel("Position error [m]")
-    axes[1].set_ylabel("Velocity error [m/s]")
-    axes[2].set_ylabel("||GRFs|| [N]")
-    axes[2].set_xlabel("Time [s]")
-    axes[0].legend()
-
-    for ax in axes:
-        ax.grid(True, alpha=0.3)
-        if disturbance_type == "impulse":
-            ax.axvspan(2.0, 2.15, alpha=0.12)
-        elif disturbance_type == "persistent":
-            ax.axvspan(2.0, t[-1], alpha=0.05)
-
-    plt.tight_layout()
-    path = f"results/mujoco_comparison_{robot_name}_{disturbance_type}.png"
-    plt.savefig(path, dpi=150)
-    plt.close()
-    print(f"\n  Comparison plot saved: {path}")
-
-
-# =====================================================================
-# Main run
-# =====================================================================
 def run(
     controller_name: str,
     robot_name: str = "mini_cheetah",
     teleop_enabled: bool = False,
     render: bool = True,
     duration: float = 10.0,
-    disturbance_type: str = "impulse",
+    disturbance_type: str = "none",
     save_log: bool = True,
+    trajectory_name: str = "none",
+    waypoint_speed: float = 0.05,
 ):
     print(f"\n{'=' * 60}")
     print(f"  Controller:   {controller_name.upper()}")
@@ -422,6 +355,9 @@ def run(
     print(f"  Teleop:       {teleop_enabled}")
     print(f"  Duration:     {duration}s")
     print(f"  Disturbance:  {disturbance_type}")
+    if trajectory_name != "none":
+        print(f"  Trajectory:   {trajectory_name}")
+        print(f"  WP speed:     {waypoint_speed:.2f} m/s")
     print(f"{'=' * 60}\n")
 
     state_obs_names = tuple(QuadrupedEnv.ALL_OBS)
@@ -439,21 +375,31 @@ def run(
         env.render()
 
     teleop = TeleopState()
-    teleop_thread = None
-    if teleop_enabled:
-        teleop_thread = threading.Thread(
-            target=teleop_keyboard_loop,
-            args=(teleop,),
-            daemon=True,
-        )
+    if teleop_enabled and trajectory_name == "none":
+        teleop_thread = threading.Thread(target=teleop_keyboard_loop, args=(teleop,), daemon=True)
         teleop_thread.start()
 
     dyn = build_dynamics()
     Q, R, Q_f = build_cost_matrices()
 
-    x_ref = build_reference_state(dyn, height=ROBOT_HIP_HEIGHT, vx=0.0, vy=0.0, wz=0.0)
+    x0 = get_state(env)
+
+    q_dict0, dq_dict0 = get_joint_state_dict(env)
+    gait = TrotGaitScheduler(period=0.55, duty_factor=0.60)
+    gait_planner = JointSpaceTrotPlanner(q_dict0)
+
+    trajectory = None
+    if trajectory_name != "none":
+        wps = build_named_trajectory(trajectory_name)
+        wps[:, 0] += x0[0]
+        wps[:, 1] += x0[1]
+        trajectory = WaypointTrajectory(wps, speed=waypoint_speed, dt=0.01, start_delay=3.0)
+
+    x_ref0 = build_reference_state_from_velocity_guidance(
+        x=x0, height=ROBOT_HIP_HEIGHT, vx_cmd=0.0, vy_cmd=0.0, yaw_cmd=x0[8], wz_cmd=0.0
+    )
     u_ref = dyn.standing_control()
-    controller = build_controller(controller_name, dyn, Q, R, Q_f, x_ref)
+    controller = build_controller(controller_name, dyn, Q, R, Q_f, x_ref0)
 
     ori_ekf = OrientationEKF(dt=env.mjModel.opt.timestep)
 
@@ -462,8 +408,9 @@ def run(
     ctrl_steps = max(1, int(ctrl_dt / sim_dt))
     n_steps = int(duration / sim_dt)
 
-    log_t, log_x, log_u, log_err, log_dist = [], [], [], [], []
+    log_t, log_x, log_pos_ref, log_u, log_err, log_dist = [], [], [], [], [], []
     current_grfs = u_ref.copy()
+    stable_resets = 0
 
     print(f"  Sim dt: {sim_dt}s, Ctrl rate: {1 / ctrl_dt:.0f} Hz, Total steps: {n_steps}")
     print("  Starting simulation...\n")
@@ -471,40 +418,46 @@ def run(
     try:
         for step in range(n_steps):
             t = step * sim_dt
-
             x = get_state(env)
             contact = get_contacts(env)
             r_feet = get_feet_world(env)
 
-            cmd_vx = teleop.vx if teleop_enabled else 0.0
-            cmd_vy = teleop.vy if teleop_enabled else 0.0
-            cmd_wz = teleop.wz if teleop_enabled else 0.0
+            if trajectory is not None:
+                vx_cmd, vy_cmd, yaw_cmd, wz_cmd, pos_ref = make_velocity_command_from_waypoints(
+                    x, trajectory, t, speed_cap=waypoint_speed, yaw_k=0.4
+                )
+            else:
+                vx_cmd = teleop.vx if teleop_enabled else 0.0
+                vy_cmd = teleop.vy if teleop_enabled else 0.0
+                wz_cmd = teleop.wz if teleop_enabled else 0.0
+                yaw_cmd = x[8]
+                pos_ref = np.array([x[0], x[1], ROBOT_HIP_HEIGHT])
 
-            x_ref = build_reference_state(
-                dyn,
+            x_ref = build_reference_state_from_velocity_guidance(
+                x=x,
                 height=ROBOT_HIP_HEIGHT,
-                vx=cmd_vx,
-                vy=cmd_vy,
-                wz=cmd_wz,
+                vx_cmd=vx_cmd,
+                vy_cmd=vy_cmd,
+                yaw_cmd=yaw_cmd,
+                wz_cmd=wz_cmd,
             )
 
-            try:
-                if hasattr(env, "target_base_vel"):
-                    env.target_base_vel[:] = np.array([cmd_vx, cmd_vy, 0.0])
-                if hasattr(env, "target_base_ang_vel"):
-                    env.target_base_ang_vel[:] = np.array([0.0, 0.0, cmd_wz])
-                if hasattr(env, "ref_base_lin_vel"):
-                    env.ref_base_lin_vel = cmd_vx
-            except Exception:
-                pass
+            q_dict, dq_dict = get_joint_state_dict(env)
+            q_des_dict = gait_planner.get_joint_targets(
+                t=t,
+                gait=gait,
+                vx_cmd=vx_cmd,
+                vy_cmd=vy_cmd,
+                wz_cmd=wz_cmd,
+            )
 
             dist = np.zeros(6)
             if disturbance_type == "impulse":
                 if 2.0 <= t < 2.15:
-                    dist = np.array([50.0, 25.0, 0.0, 0.0, 0.0, 5.0])
+                    dist = np.array([30.0, 10.0, 0.0, 0.0, 0.0, 2.0])
             elif disturbance_type == "persistent":
                 if t >= 2.0:
-                    dist = np.array([15.0, 8.0, 0.0, 0.0, 0.0, 2.0])
+                    dist = np.array([8.0, 3.0, 0.0, 0.0, 0.0, 1.0])
 
             env.mjData.qfrc_applied[:6] = dist
 
@@ -517,36 +470,29 @@ def run(
 
             if step % ctrl_steps == 0:
                 try:
-                    _A_c_new, _B_c_new = dyn.continuous_AB(x, contact, r_feet)
-                    _A_d_new, _B_d_new = dyn.discretize(_A_c_new, _B_c_new)
-                    _g_d = dyn.gravity_vector()
-                except Exception:
-                    pass
-
-                try:
                     if controller_name == "lqg":
                         y = x + np.random.randn(12) * np.array(
                             [5e-3] * 3 + [2e-2] * 3 + [1e-2] * 3 + [5e-2] * 3
                         )
                         current_grfs = controller.step(y, x_ref, u_ref)
                     else:
-                        current_grfs = controller.compute_control(
-                            x=x,
-                            x_ref=x_ref,
-                            u_ref=u_ref,
-                        )
+                        current_grfs = controller.compute_control(x=x, x_ref=x_ref, u_ref=u_ref)
                 except Exception as e:
                     if step < 5:
                         print(f"  Controller error at t={t:.3f}: {e}")
                     current_grfs = u_ref.copy()
 
-                current_grfs = np.clip(current_grfs, -150.0, 150.0)
-
+                current_grfs = np.clip(current_grfs, -100.0, 100.0)
                 for i in range(4):
                     if not contact[i]:
                         current_grfs[3 * i:3 * i + 3] = 0.0
 
-            tau = grf_to_torques(env, current_grfs, contact)
+            tau_body = grf_to_torques(env, current_grfs, contact)
+            tau_gait = compute_gait_pd_torque(env, q_des_dict, q_dict, dq_dict)
+
+            tau = tau_body + 0.55 * tau_gait
+            tau = np.clip(tau, -22.0, 22.0)
+
             _, _, terminated, _, _ = env.step(action=tau)
 
             if render:
@@ -554,145 +500,105 @@ def run(
 
             log_t.append(t)
             log_x.append(x.copy())
+            log_pos_ref.append(pos_ref.copy())
             log_u.append(current_grfs.copy())
-            log_err.append(np.linalg.norm(x[:6] - x_ref[:6]))
+            log_err.append(np.linalg.norm(x[3:6] - x_ref[3:6]))
             log_dist.append(np.linalg.norm(dist))
 
             if step % int(1.0 / sim_dt) == 0:
-                pos_err = np.linalg.norm(x[:3] - x_ref[:3])
+                pos_err = np.linalg.norm(x[:2] - pos_ref[:2])
                 vel_err = np.linalg.norm(x[3:6] - x_ref[3:6])
                 print(
                     f"  t={t:5.1f}s | pos_err={pos_err:.4f}m | "
                     f"vel_err={vel_err:.4f}m/s | "
                     f"height={x[2]:.3f}m | "
                     f"vx={x[3]:+.3f} | vy={x[4]:+.3f} | wz={x[11]:+.3f} | "
-                    f"cmd=({cmd_vx:+.2f},{cmd_vy:+.2f},{cmd_wz:+.2f})"
+                    f"cmd=({vx_cmd:+.2f},{vy_cmd:+.2f},{wz_cmd:+.2f})"
                 )
 
             if terminated:
                 print(f"  Terminated at t={t:.2f}s")
+                stable_resets += 1
                 _ = env.reset(random=False)
+
+                ori_ekf = OrientationEKF(dt=env.mjModel.opt.timestep)
+                x_reset = get_state(env)
+                x_ref_reset = build_reference_state_from_velocity_guidance(
+                    x=x_reset,
+                    height=ROBOT_HIP_HEIGHT,
+                    vx_cmd=0.0,
+                    vy_cmd=0.0,
+                    yaw_cmd=x_reset[8],
+                    wz_cmd=0.0,
+                )
+                controller = build_controller(controller_name, dyn, Q, R, Q_f, x_ref_reset)
+                current_grfs = u_ref.copy()
+
+                q_dict_reset, dq_dict_reset = get_joint_state_dict(env)
+                gait = TrotGaitScheduler(period=0.55, duty_factor=0.60)
+                gait_planner = JointSpaceTrotPlanner(q_dict_reset)
+
                 if render:
                     env.render()
 
     except KeyboardInterrupt:
         print("\n  Interrupted by user.")
-
     finally:
         teleop.quit_requested = True
         env.close()
 
-    log_t = np.array(log_t) if len(log_t) > 0 else np.zeros(1)
-    log_x = np.array(log_x) if len(log_x) > 0 else np.zeros((1, 12))
-    log_u = np.array(log_u) if len(log_u) > 0 else np.zeros((1, 12))
-    log_err = np.array(log_err) if len(log_err) > 0 else np.zeros(1)
-    log_dist = np.array(log_dist) if len(log_dist) > 0 else np.zeros(1)
+    log_t = np.array(log_t)
+    log_x = np.array(log_x)
+    log_pos_ref = np.array(log_pos_ref)
+    log_u = np.array(log_u)
+    log_err = np.array(log_err)
+    log_dist = np.array(log_dist)
 
     result = {
         "time": log_t,
         "state": log_x,
+        "pos_ref": log_pos_ref,
         "control": log_u,
         "error": log_err,
         "disturbance": log_dist,
     }
 
     if save_log and len(log_t) > 1:
-        x_ref_nominal = build_reference_state(dyn, height=ROBOT_HIP_HEIGHT, vx=0.0, vy=0.0, wz=0.0)
-        save_single_run_plot(result, controller_name, robot_name, disturbance_type, x_ref_nominal)
+        save_single_run_plot(result, controller_name, robot_name, disturbance_type)
+
+    xy_rmse = np.sqrt(np.mean(np.sum((log_x[:, :2] - log_pos_ref[:, :2]) ** 2, axis=1)))
+    xy_max = np.max(np.linalg.norm(log_x[:, :2] - log_pos_ref[:, :2], axis=1))
 
     print(f"\n  --- {controller_name.upper()} Summary ---")
-    print(f"  Position/velocity RMSE: {np.sqrt(np.mean(log_err**2)):.4f}")
-    print(f"  Max error: {np.max(log_err):.4f}")
+    print(f"  Velocity RMSE: {np.sqrt(np.mean(log_err**2)):.4f}")
+    print(f"  XY tracking RMSE: {xy_rmse:.4f} m")
+    print(f"  XY max tracking error: {xy_max:.4f} m")
     print(f"  Mean GRF norm: {np.mean(np.linalg.norm(log_u, axis=1)):.1f} N")
+    print(f"  Resets: {stable_resets}")
 
     return result
 
 
-# =====================================================================
-# Comparison mode
-# =====================================================================
-def run_comparison(
-    render: bool,
-    duration: float,
-    disturbance_type: str,
-    robot_name: str,
-):
-    results = {}
-    for name in ["pmp", "lqg", "mpc"]:
-        results[name] = run(
-            name,
-            robot_name=robot_name,
-            teleop_enabled=False,
-            render=render,
-            duration=duration,
-            disturbance_type=disturbance_type,
-            save_log=False,
-        )
-
-    save_comparison_plot(results, robot_name, disturbance_type)
-
-    print(f"\n{'=' * 60}")
-    print(f"  COMPARISON SUMMARY ({disturbance_type})")
-    print(f"{'=' * 60}")
-    print(f"  {'Controller':<12} {'RMSE':>10} {'Mean ||u||':>12}")
-    print(f"  {'-' * 38}")
-    for name, data in results.items():
-        print(
-            f"  {name.upper():<12} "
-            f"{np.sqrt(np.mean(data['error']**2)):>10.4f} "
-            f"{np.mean(np.linalg.norm(data['control'], axis=1)):>12.1f}"
-        )
-    print(f"{'=' * 60}")
-
-
-# =====================================================================
-# CLI
-# =====================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Quadruped control with MuJoCo rendering")
-    parser.add_argument("--controller", default="lqg", choices=["pmp", "lqg", "mpc", "all"])
-    parser.add_argument(
-        "--robot-name",
-        type=str,
-        default="mini_cheetah",
-        help="Robot name, e.g. mini_cheetah, aliengo, go2, hyqreal",
-    )
-    parser.add_argument(
-        "--teleop",
-        action="store_true",
-        help="Enable keyboard teleoperation for commanded velocities",
-    )
+    parser.add_argument("--controller", default="lqg", choices=["pmp", "lqg", "mpc"])
+    parser.add_argument("--robot-name", type=str, default="mini_cheetah")
+    parser.add_argument("--teleop", action="store_true")
     parser.add_argument("--duration", type=float, default=8.0)
-    parser.add_argument(
-        "--disturbance",
-        default="impulse",
-        choices=["impulse", "persistent", "none"],
-    )
-    parser.add_argument(
-        "--no-render",
-        action="store_true",
-        help="Run headless without viewer",
-    )
+    parser.add_argument("--disturbance", default="none", choices=["impulse", "persistent", "none"])
+    parser.add_argument("--no-render", action="store_true")
+    parser.add_argument("--trajectory", type=str, default="none", choices=["none", "line", "square", "zigzag"])
+    parser.add_argument("--waypoint-speed", type=float, default=0.05)
     args = parser.parse_args()
 
-    do_render = not args.no_render
-
-    if args.controller == "all":
-        if args.teleop:
-            print("Teleop is ignored in comparison mode; running fixed references only.")
-        run_comparison(
-            render=do_render,
-            duration=args.duration,
-            disturbance_type=args.disturbance,
-            robot_name=args.robot_name,
-        )
-    else:
-        run(
-            controller_name=args.controller,
-            robot_name=args.robot_name,
-            teleop_enabled=args.teleop,
-            render=do_render,
-            duration=args.duration,
-            disturbance_type=args.disturbance,
-            save_log=True,
-        )
+    run(
+        controller_name=args.controller,
+        robot_name=args.robot_name,
+        teleop_enabled=args.teleop,
+        render=not args.no_render,
+        duration=args.duration,
+        disturbance_type=args.disturbance,
+        save_log=True,
+        trajectory_name=args.trajectory,
+        waypoint_speed=args.waypoint_speed,
+    )
