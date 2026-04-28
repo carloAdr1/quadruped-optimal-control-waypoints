@@ -566,18 +566,61 @@ def run(
     if save_log and len(log_t) > 1:
         save_single_run_plot(result, controller_name, robot_name, disturbance_type)
 
-    xy_rmse = np.sqrt(np.mean(np.sum((log_x[:, :2] - log_pos_ref[:, :2]) ** 2, axis=1)))
-    xy_max = np.max(np.linalg.norm(log_x[:, :2] - log_pos_ref[:, :2], axis=1))
-
+    xy_error_vec = np.linalg.norm(log_x[:, :2] - log_pos_ref[:, :2], axis=1)
+    xy_rmse = np.sqrt(np.mean(xy_error_vec ** 2))
+    xy_max = np.max(xy_error_vec)
+    vel_rmse = np.sqrt(np.mean(log_err ** 2))
+    mean_grf = np.mean(np.linalg.norm(log_u, axis=1))
+    final_xy_error = xy_error_vec[-1]
     print(f"\n  --- {controller_name.upper()} Summary ---")
-    print(f"  Velocity RMSE: {np.sqrt(np.mean(log_err**2)):.4f}")
+    print(f"  Velocity RMSE: {vel_rmse:.4f}")
     print(f"  XY tracking RMSE: {xy_rmse:.4f} m")
     print(f"  XY max tracking error: {xy_max:.4f} m")
-    print(f"  Mean GRF norm: {np.mean(np.linalg.norm(log_u, axis=1)):.1f} N")
+    print(f"  Final XY error: {final_xy_error:.4f} m")
+    print(f"  Mean GRF norm: {mean_grf:.1f} N")
     print(f"  Resets: {stable_resets}")
 
-    return result
+    os.makedirs("results", exist_ok=True)
 
+    metrics_path = f"results/metrics_{controller_name}_{trajectory_name}_{disturbance_type}.csv"
+    with open(metrics_path, "w") as f:
+        f.write(
+            "controller,trajectory,disturbance,velocity_rmse,"
+            "xy_rmse,xy_max_error,final_xy_error,mean_grf_norm,resets\n"
+        )
+        f.write(
+            f"{controller_name},{trajectory_name},{disturbance_type},"
+            f"{vel_rmse:.6f},"
+            f"{xy_rmse:.6f},"
+            f"{xy_max:.6f},"
+            f"{final_xy_error:.6f},"
+            f"{mean_grf:.6f},"
+            f"{stable_resets}\n"
+        )
+
+    log_path = f"results/log_{controller_name}_{trajectory_name}_{disturbance_type}.csv"
+    with open(log_path, "w") as f:
+        f.write(
+            "t,x,y,z,x_ref,y_ref,z_ref,"
+            "vx,vy,vz,xy_error,control_norm,disturbance_norm\n"
+        )
+        for i in range(len(log_t)):
+            xy_error = np.linalg.norm(log_x[i, :2] - log_pos_ref[i, :2])
+            control_norm = np.linalg.norm(log_u[i])
+            f.write(
+                f"{log_t[i]:.6f},"
+                f"{log_x[i,0]:.6f},{log_x[i,1]:.6f},{log_x[i,2]:.6f},"
+                f"{log_pos_ref[i,0]:.6f},{log_pos_ref[i,1]:.6f},{log_pos_ref[i,2]:.6f},"
+                f"{log_x[i,3]:.6f},{log_x[i,4]:.6f},{log_x[i,5]:.6f},"
+                f"{xy_error:.6f},"
+                f"{control_norm:.6f},"
+                f"{log_dist[i]:.6f}\n"
+            )
+
+    print(f"  Metrics CSV saved: {metrics_path}")
+    print(f"  Log CSV saved:     {log_path}")
+
+    return result
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Quadruped control with MuJoCo rendering")

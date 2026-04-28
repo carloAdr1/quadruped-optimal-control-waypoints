@@ -214,7 +214,7 @@ class MPCController:
         solver.setup(P_sp, f, A_sp, d_lower, d_upper,
                      verbose=False, warm_start=True,
                      eps_abs=1e-4, eps_rel=1e-4,
-                     max_iter=200, polish=True)
+                     max_iter=200, polish=False)
         result = solver.solve()
 
         if result.info.status == 'solved' or result.info.status == 'solved_inaccurate':
